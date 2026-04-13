@@ -50,7 +50,7 @@ def _start_loop():
 def _run(coro):
     """Запустить корутину в фоновом event loop и дождаться результата."""
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=120)
+    return future.result(timeout=15)
 
 try:
     import opengradient as _og
