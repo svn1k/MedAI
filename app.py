@@ -8,7 +8,7 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-
+from flask import send_from_directory
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
@@ -366,6 +366,9 @@ def health():
     })
 
 
+@app.route("/")
+def index():
+    return send_from_directory(".", "index.html")
 @app.route("/probe", methods=["GET"])
 def probe():
     global WORKING_MODEL
