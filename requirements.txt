@@ -5,3 +5,5 @@ requests
 opengradient
 urllib3
 gunicorn
+langchain>=0.3.0
+langchain-core>=0.3.0
