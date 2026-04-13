@@ -5,10 +5,10 @@ import time
 import asyncio
 import threading
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
-from flask import send_from_directory
+
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
@@ -18,26 +18,22 @@ OG_OK = False
 llm_client = None
 og = None
 WORKING_MODEL = None
+_ready = False
+_init_done = False
+_init_lock = threading.Lock()
 
 MODEL_PRIORITY = [
-    "GEMINI_2_5_FLASH_LITE",
-    "GEMINI_2_5_FLASH",
     "CLAUDE_HAIKU_4_5",
-    "GPT_5_MINI",
     "CLAUDE_SONNET_4_5",
     "CLAUDE_SONNET_4_6",
+    "GPT_5_MINI",
+    "GEMINI_2_5_FLASH_LITE",
+    "GEMINI_2_5_FLASH",
     "GEMINI_2_5_PRO",
     "GEMINI_3_FLASH",
-    "GPT_4_1_2025_04_14",
-    "CLAUDE_OPUS_4_5",
-    "CLAUDE_OPUS_4_6",
-    "GROK_4_FAST",
-    "GROK_4",
-    "GPT_5",
-    "O4_MINI",
 ]
 
-# Единый event loop в отдельном потоке
+# ── Event loop ─────────────────────────────────────────────────────────────
 _loop = None
 _loop_thread = None
 
@@ -47,74 +43,214 @@ def _start_loop():
     asyncio.set_event_loop(_loop)
     _loop.run_forever()
 
-def _run(coro):
-    """Запустить корутину в фоновом event loop и дождаться результата."""
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=15)
+def _ensure_loop():
+    global _loop
+    if _loop is None:
+        t = threading.Thread(target=_start_loop, daemon=True)
+        t.start()
+        deadline = time.time() + 10
+        while _loop is None and time.time() < deadline:
+            time.sleep(0.05)
 
-try:
-    import opengradient as _og
-    import ssl
-    import urllib3
+def _run(coro, timeout=120):
+    _ensure_loop()
+    if _loop is None:
+        raise RuntimeError("Event loop not ready")
+    async def _with_timeout():
+        return await asyncio.wait_for(coro, timeout=timeout)
+    return asyncio.run_coroutine_threadsafe(_with_timeout(), _loop).result(timeout=timeout + 5)
 
-    og = _og
-    ssl._create_default_https_context = ssl._create_unverified_context
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    # Запускаем фоновый event loop
-    _loop_thread = threading.Thread(target=_start_loop, daemon=True)
-    _loop_thread.start()
-    time.sleep(0.2)  # ждём пока loop запустится
-
-    private_key = os.environ["OG_PRIVATE_KEY"]
-    llm_client = og.LLM(private_key=private_key)
-
-    # Approve токенов при старте
+# ── OG init ────────────────────────────────────────────────────────────────
+def _init_og():
+    global OG_OK, llm_client, og, _ready, _init_done, WORKING_MODEL
+    with _init_lock:
+        if _init_done:
+            return
+        _init_done = True
     try:
-        approval = llm_client.ensure_opg_approval(opg_amount=0.1)
-        print(f"OPG approval: {approval}")
+        import opengradient as _og
+        import ssl
+        import urllib3
+        og = _og
+        ssl._create_default_https_context = ssl._create_unverified_context
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        private_key = os.environ.get("OG_PRIVATE_KEY", "")
+        if not private_key:
+            raise ValueError("OG_PRIVATE_KEY not set")
+        print(f"OG_PRIVATE_KEY found: {private_key[:6]}...")
+        llm_client = og.LLM(private_key=private_key)
+        try:
+            approval = llm_client.ensure_opg_approval(min_allowance=0.1)
+            print(f"OPG approval: {approval}")
+        except Exception as e:
+            print(f"Approval warning (continuing): {e}")
+        OG_OK = True
+        print("OG connected — selecting model...")
+        _pick_model()
     except Exception as e:
-        print(f"Approval warning: {e}")
+        import traceback
+        print(f"OG init failed: {e}\n{traceback.format_exc()}")
+    finally:
+        _ready = True
+        print(f"OG ready. OG_OK={OG_OK}, model={WORKING_MODEL}")
 
-    OG_OK = True
-    print("OG connected")
-except Exception as e:
-    print(f"Demo mode: {e}")
-    OG_OK = False
-    llm_client = None
-    og = None
-
-
-# ── Поиск рабочей модели ──────────────────────────────────────────────────────
-def probe_models():
+def _pick_model():
     global WORKING_MODEL
-    if not OG_OK or llm_client is None or og is None:
+    if not OG_OK or llm_client is None:
         return
-
-    print("Probing models...")
     for name in MODEL_PRIORITY:
         if not hasattr(og.TEE_LLM, name):
             continue
-        model_enum = getattr(og.TEE_LLM, name)
+        model = getattr(og.TEE_LLM, name)
         try:
-            print(f"Testing {name}...")
+            print(f"  Trying {name}...")
             result = _run(llm_client.chat(
-                model=model_enum,
-                messages=[{"role": "user", "content": "Reply: OK"}],
+                model=model,
+                messages=[{"role": "user", "content": "Say: OK"}],
                 max_tokens=5,
                 temperature=0.0,
-            ))
-            raw = extract_raw(result)
-            if raw.strip():
-                WORKING_MODEL = model_enum
-                print(f"Using model: {name}")
+            ), timeout=90)
+            raw = _extract_raw(result)
+            if raw and raw.strip():
+                WORKING_MODEL = model
+                print(f"✓ Model selected: {name}")
                 return
         except Exception as e:
-            print(f"  FAIL {name}: {e}")
-    print("No working model found.")
+            print(f"  {name} failed: {e}")
+    print("WARNING: No working model found")
 
+def _ensure_og():
+    if not _init_done:
+        t = threading.Thread(target=_init_og, daemon=True)
+        t.start()
+        t.join(timeout=180)
 
-# ── Web search via DuckDuckGo ─────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
+def _extract_raw(result):
+    if not result:
+        return ""
+    for attr in ['chat_output', 'completion_output', 'content', 'text', 'output']:
+        val = getattr(result, attr, None)
+        if val:
+            if isinstance(val, dict) and val.get('content'):
+                return str(val['content'])
+            if isinstance(val, str) and val.strip():
+                return val
+    for attr in dir(result):
+        if attr.startswith('_'):
+            continue
+        try:
+            val = getattr(result, attr)
+            if callable(val):
+                continue
+            if isinstance(val, str) and val.strip() and len(val) > 2:
+                return val
+        except:
+            pass
+    return ""
+
+def parse_json(raw):
+    if not raw or not raw.strip():
+        return {"error": "Empty response from LLM"}
+    m = re.search(r"<JSON>(.*?)</JSON>", raw, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+        try:
+            return json.loads(text)
+        except Exception as e:
+            print(f"PARSE: <JSON> tag found but JSON invalid: {e}")
+    m = re.search(r'\{[\s\S]*?"disease"[\s\S]*\}', raw)
+    if m:
+        text = m.group(0)
+        try:
+            return json.loads(text)
+        except:
+            try:
+                open_braces = text.count('{') - text.count('}')
+                open_brackets = text.count('[') - text.count(']')
+                fixed = text + ']' * max(0, open_brackets) + '}' * max(0, open_braces)
+                return json.loads(fixed)
+            except:
+                pass
+    print("PARSE FAILED. Full raw repr:", repr(raw[:500]))
+    return {"error": "Parse failed", "raw": raw[:300]}
+
+def call_llm(messages, retries=3):
+    global WORKING_MODEL
+    _ensure_og()
+    if not OG_OK or llm_client is None:
+        return demo_stats(messages)
+    if WORKING_MODEL is None:
+        _pick_model()
+    if WORKING_MODEL is None:
+        return demo_stats(messages)
+
+    last_error = "Unknown error"
+    for attempt in range(retries):
+        try:
+            print(f"\nLLM attempt {attempt+1}/{retries} | model: {WORKING_MODEL}")
+            result = _run(llm_client.chat(
+                model=WORKING_MODEL,
+                messages=messages,
+                max_tokens=3000,
+                temperature=0.3,
+            ), timeout=120)
+            raw = _extract_raw(result)
+            if not raw.strip():
+                last_error = "Empty response"
+                time.sleep(2)
+                continue
+            parsed = parse_json(raw)
+            if "error" in parsed:
+                last_error = parsed.get("error", "Parse failed")
+                time.sleep(1)
+                continue
+            tx = getattr(result, "transaction_hash", None) or getattr(result, "payment_hash", None)
+            if tx:
+                parsed["proof"] = {
+                    "transaction_hash": tx,
+                    "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
+                }
+            return parsed
+        except Exception as e:
+            last_error = str(e)
+            print(f"LLM exception attempt {attempt+1}: {e}")
+            if "402" in str(e):
+                WORKING_MODEL = None
+                _pick_model()
+                if WORKING_MODEL is None:
+                    break
+            else:
+                time.sleep(2)
+    return demo_stats(messages)
+
+def demo_stats(messages):
+    disease = "Unknown"
+    if messages and isinstance(messages, list):
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    for line in content.split("\n"):
+                        if "Disease:" in line:
+                            disease = line.replace("Disease:", "").strip()[:80]
+                            break
+                    break
+    return {
+        "disease": disease or "Unknown",
+        "summary": f"Could not retrieve statistics for '{disease}' - OpenGradient TEE unavailable.",
+        "key_stats": [],
+        "trend_years": [],
+        "age_groups": [],
+        "countries": [],
+        "risk_factors": [],
+        "insights": ["TEE connection failed. Check console for details."],
+        "sources": [],
+        "proof": None,
+        "error_state": True,
+    }
+
+# ── Web search via DuckDuckGo ────────────────────────────────────────────────
 def web_search(query, max_results=6):
     results = []
     try:
@@ -138,7 +274,6 @@ def web_search(query, max_results=6):
         print(f"Search error: {e}")
     return results
 
-
 def gather_statistics(disease):
     queries = [
         f"{disease} global prevalence statistics 2023 2024 WHO",
@@ -150,14 +285,12 @@ def gather_statistics(disease):
     all_results = []
     for q in queries:
         all_results.extend(web_search(q, max_results=4))
-
     seen, unique = set(), []
     for r in all_results:
         if r["url"] not in seen:
             seen.add(r["url"])
             unique.append(r)
     return unique[:18]
-
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a medical statistics analyst. Reply ONLY with valid JSON inside <JSON>...</JSON> tags. No text outside.
@@ -206,179 +339,29 @@ Rules:
 - Mark estimated values with source "estimated"
 """
 
-
-# ── Извлечение текста из ответа ───────────────────────────────────────────────
-def extract_raw(result):
-    if not result:
-        return ""
-    co = getattr(result, 'chat_output', None)
-    if co:
-        if isinstance(co, dict):
-            for k in ('content', 'text', 'message', 'response', 'output'):
-                if co.get(k):
-                    return str(co[k])
-        elif isinstance(co, str) and co.strip():
-            return co
-        elif isinstance(co, list) and co:
-            first = co[0]
-            if isinstance(first, dict):
-                for k in ('content', 'text'):
-                    if first.get(k):
-                        return str(first[k])
-                if first.get('message', {}).get('content'):
-                    return first['message']['content']
-    comp = getattr(result, 'completion_output', None)
-    if comp and str(comp).strip():
-        return str(comp)
-    if hasattr(result, 'text'):
-        return result.text
-    for attr in dir(result):
-        if attr.startswith('_'):
-            continue
-        try:
-            val = getattr(result, attr)
-            if callable(val):
-                continue
-            if isinstance(val, str) and ('<JSON>' in val or '"disease"' in val):
-                return val
-        except:
-            pass
-    return ""
-
-
-def parse_json(raw):
-    if not raw or not raw.strip():
-        return {"error": "Empty response from LLM"}
-    m = re.search(r"<JSON>(.*?)</JSON>", raw, re.DOTALL)
-    if m:
-        text = m.group(1).strip()
-        try:
-            return json.loads(text)
-        except Exception as e:
-            print(f"PARSE: <JSON> tag found but JSON invalid: {e}")
-    m = re.search(r'\{[\s\S]*?"disease"[\s\S]*\}', raw)
-    if m:
-        text = m.group(0)
-        try:
-            return json.loads(text)
-        except:
-            try:
-                open_braces = text.count('{') - text.count('}')
-                open_brackets = text.count('[') - text.count(']')
-                fixed = text + ']' * max(0, open_brackets) + '}' * max(0, open_braces)
-                return json.loads(fixed)
-            except:
-                pass
-    print("PARSE FAILED. Full raw repr:", repr(raw[:500]))
-    return {"error": "Parse failed", "raw": raw[:300]}
-
-
-def call_llm(messages, retries=3):  # ИСПРАВЛЕНО: теперь принимает messages как в CV Analyzer
-    global WORKING_MODEL
-
-    if not OG_OK or llm_client is None:
-        return demo_stats(messages)
-
-    if WORKING_MODEL is None:
-        probe_models()
-    if WORKING_MODEL is None:
-        return demo_stats(messages)
-
-    last_error = "Unknown error"
-    for attempt in range(retries):
-        try:
-            print(f"\nLLM attempt {attempt+1}/{retries} | model: {WORKING_MODEL}")
-            result = _run(llm_client.chat(
-                model=WORKING_MODEL,
-                messages=messages,  # ИСПРАВЛЕНО: прямая передача messages
-                max_tokens=3000,
-                temperature=0.3,
-            ))
-            raw = extract_raw(result)
-            if not raw.strip():
-                last_error = "Empty response"
-                time.sleep(2)
-                continue
-            parsed = parse_json(raw)
-            if "error" in parsed:
-                last_error = parsed.get("error", "Parse failed")
-                time.sleep(1)
-                continue
-            tx = getattr(result, "transaction_hash", None)
-            if tx:
-                parsed["proof"] = {
-                    "transaction_hash": tx,
-                    "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
-                }
-            return parsed
-        except Exception as e:
-            last_error = str(e)
-            print(f"LLM exception attempt {attempt+1}: {e}")
-            if "402" in str(e):
-                WORKING_MODEL = None
-                probe_models()
-                if WORKING_MODEL is None:
-                    break
-            else:
-                time.sleep(2)
-
-    return demo_stats(messages)
-
-
-def demo_stats(messages):
-    # ИСПРАВЛЕНО: извлекаем disease из сообщений
-    disease = "Unknown"
-    if messages and isinstance(messages, list):
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Пытаемся извлечь disease из prompt
-                    lines = content.split("\n")
-                    for line in lines:
-                        if "Disease:" in line:
-                            disease = line.replace("Disease:", "").strip()[:80]
-                            break
-                    break
-    
-    return {
-        "disease": disease or "Unknown",
-        "summary": f"Could not retrieve statistics for '{disease}' - OpenGradient TEE unavailable.",
-        "key_stats": [],
-        "trend_years": [],
-        "age_groups": [],
-        "countries": [],
-        "risk_factors": [],
-        "insights": ["TEE connection failed. Check console for details."],
-        "sources": [],
-        "proof": None,
-        "error_state": True,
-    }
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return send_from_directory(".", "index.html")
+
 @app.route("/health")
 def health():
     return jsonify({
         "status": "ok",
         "og": OG_OK,
+        "ready": _ready,
         "model": str(WORKING_MODEL) if WORKING_MODEL else None,
     })
 
-
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
 @app.route("/probe", methods=["GET"])
 def probe():
     global WORKING_MODEL
     WORKING_MODEL = None
-    probe_models()
+    _pick_model()
     return jsonify({
         "working_model": str(WORKING_MODEL) if WORKING_MODEL else None,
         "og_ok": OG_OK,
     })
-
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -395,26 +378,24 @@ def search():
         for r in raw_results[:6]
     )
 
-    # ИСПРАВЛЕНО: создаем messages как в CV Analyzer
     user_content = (
         f"Disease: {disease}\n\n"
         f"Web search snippets:\n{snippets_text}\n\n"
         f"Fill the JSON with statistics for {disease}. Use search data + your knowledge."
     )
-    
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content}
     ]
 
-    result = call_llm(messages)  # ИСПРАВЛЕНО: передаем messages
+    result = call_llm(messages)
     result["search_count"] = len(raw_results)
     return jsonify(result)
 
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"MedAI Statistics on :{port} | OG: {'live' if OG_OK else 'demo'}")
-    if OG_OK:
-        probe_models()
+    # Инициализируем OpenGradient до запуска сервера
+    _ensure_og()
+    print(f"MedAI Statistics on :{port} | OG: {'live' if OG_OK else 'demo'}, model: {WORKING_MODEL}")
     app.run(host="0.0.0.0", port=port, debug=False)
